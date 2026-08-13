@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=robotwin-test
+#SBATCH --job-name=robotwin-install
 #SBATCH --partition=a40
 #SBATCH --gres=gpu:a40:1
 #SBATCH --cpus-per-task=4
@@ -17,14 +17,22 @@ micromamba activate robotwin
 
 module load cuda/12.8.1
 
-echo "=== NODE ==="
-hostname
+export CUDA_HOME="$(dirname "$(dirname "$(readlink -f "$(which nvcc)")")")"
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
 
-echo "=== GPU ==="
-nvidia-smi
+echo "=== CUDA ==="
+echo "CUDA_HOME=$CUDA_HOME"
+which nvcc
+nvcc --version
 
-echo "=== PYTHON ==="
-python --version
+echo "=== PYTORCH ==="
+python - <<'PY'
+import torch
+print("torch:", torch.__version__)
+print("torch CUDA:", torch.version.cuda)
+print("CUDA available:", torch.cuda.is_available())
+PY
 
 echo "=== INSTALL ==="
-bash scripts/_install.sh
+bash scripts/install_alex.sh

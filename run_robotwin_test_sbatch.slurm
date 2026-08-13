@@ -10,7 +10,7 @@
 
 set -e
 
-cd "$HOME/RoboTwin"
+cd "$HOME/robotwin-2"
 
 module load cuda/12.8.1
 

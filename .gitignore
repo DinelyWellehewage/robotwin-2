@@ -29,3 +29,13 @@ envs/curobo/*
 
 /*.json*
 /*.txt
+.venv/
+logs/
+external/
+*.pyc
+heuristic_policies/policies/click_bell_invalid.json
+run_act_full.slurm
+run_act_smoke.slurm
+run_click_bell.slurm
+run_render_test.slurm
+scripts/install_alex.sh

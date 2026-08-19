@@ -39,3 +39,8 @@ run_act_smoke.slurm
 run_click_bell.slurm
 run_render_test.slurm
 scripts/install_alex.sh
+
+# Heuristic policy generated outputs
+heuristic_debug/
+heuristic_outputs/
+logs/

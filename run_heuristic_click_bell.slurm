@@ -26,6 +26,6 @@ echo "=== GPU ==="
 nvidia-smi --query-gpu=name --format=csv,noheader
 
 echo "=== HEURISTIC TEST ==="
-micromamba run -n robotwin python heuristic_policies/run_click_bell_policy.py
+micromamba run -n robotwin python -m heuristic_policies.run_click_bell_policy "$1"
 
 echo "=== FINISHED ==="

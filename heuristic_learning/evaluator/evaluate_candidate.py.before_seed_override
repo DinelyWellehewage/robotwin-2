@@ -1,0 +1,572 @@
+#!/usr/bin/env python3
+"""Evaluate a Python heuristic policy on the fixed RoboTwin search seed set."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib
+import importlib.util
+import inspect
+import json
+import os
+import re
+import sys
+from pathlib import Path
+from types import ModuleType
+from typing import Any, Callable
+
+import yaml
+
+from heuristic_learning.evaluator.public_interface import install_public_interface
+
+
+ROBOTWIN_ROOT = Path(__file__).resolve().parents[2]
+TASK_CONFIG_ROOT = ROBOTWIN_ROOT / "env_cfg" / "task_config"
+TASK_CONFIG = "demo_clean"
+
+# Search seeds are the ONLY seeds available during heuristic learning.
+# Held-out evaluation is performed separately after the search terminates.
+SEARCH_SEEDS = list(range(10))
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Evaluate a Python heuristic on the fixed RoboTwin search seeds."
+    )
+    parser.add_argument(
+        "--task",
+        required=True,
+        help="RoboTwin task name",
+    )
+    parser.add_argument(
+        "--policy",
+        required=True,
+        type=Path,
+        help="Python policy file",
+    )
+    parser.add_argument(
+        "--output",
+        required=True,
+        type=Path,
+        help="Result JSON path",
+    )
+    return parser.parse_args()
+
+
+def _validate_policy_function(function: Any) -> Callable[[Any], Any]:
+    if not callable(function):
+        raise TypeError("policy must define a callable run_heuristic(task)")
+
+    signature = inspect.signature(function)
+    parameters = list(signature.parameters.values())
+
+    if (
+        len(parameters) != 1
+        or parameters[0].kind
+        not in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    ):
+        raise TypeError(
+            "run_heuristic must accept exactly one positional argument"
+        )
+
+    return function
+
+
+def load_policy(
+    policy_path: Path,
+) -> tuple[Callable[[Any], Any], str]:
+    """Load the candidate once and return its entry point and source hash."""
+
+    policy_path = policy_path.expanduser().resolve()
+
+    if not policy_path.is_file():
+        raise FileNotFoundError(
+            f"policy file does not exist: {policy_path}"
+        )
+
+    if policy_path.suffix != ".py":
+        raise ValueError("policy must be a Python (.py) file")
+
+    source_hash = hashlib.sha256(
+        policy_path.read_bytes()
+    ).hexdigest()
+
+    module_name = (
+        f"heuristic_candidate_{source_hash[:16]}"
+    )
+
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        policy_path,
+    )
+
+    if spec is None or spec.loader is None:
+        raise ImportError(
+            f"could not load policy module: {policy_path}"
+        )
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise
+
+    function = getattr(
+        module,
+        "run_heuristic",
+        None,
+    )
+
+    return (
+        _validate_policy_function(function),
+        source_hash,
+    )
+
+
+def load_task_class(task_name: str) -> type:
+    """Resolve a normal RoboTwin task class without accepting module paths."""
+
+    if not re.fullmatch(
+        r"[A-Za-z][A-Za-z0-9_]*",
+        task_name,
+    ):
+        raise ValueError(
+            "task must be a RoboTwin task name"
+        )
+
+    module: ModuleType = importlib.import_module(
+        f"envs.{task_name}"
+    )
+
+    task_class = getattr(
+        module,
+        task_name,
+        None,
+    )
+
+    if not isinstance(task_class, type):
+        raise LookupError(
+            f"no RoboTwin task class named {task_name}"
+        )
+
+    return task_class
+
+
+def _robot_file(path_value: str) -> str:
+    path = Path(path_value)
+
+    if not path.is_absolute():
+        path = ROBOTWIN_ROOT / path
+
+    return str(path.resolve())
+
+
+def _embodiment_config(
+    robot_file: str,
+) -> dict[str, Any]:
+    with (
+        Path(robot_file) / "config.yml"
+    ).open(
+        "r",
+        encoding="utf-8",
+    ) as file:
+        return yaml.safe_load(file)
+
+
+def load_task_args(
+    task_name: str,
+) -> dict[str, Any]:
+    """Build setup_demo arguments following normal RoboTwin configuration."""
+
+    with (
+        TASK_CONFIG_ROOT / f"{TASK_CONFIG}.yml"
+    ).open(
+        "r",
+        encoding="utf-8",
+    ) as file:
+        task_args = yaml.safe_load(file)
+
+    with (
+        TASK_CONFIG_ROOT / "_embodiment_config.yml"
+    ).open(
+        "r",
+        encoding="utf-8",
+    ) as file:
+        embodiment_types = yaml.safe_load(file)
+
+    embodiment = task_args.get("embodiment")
+
+    if not isinstance(embodiment, list):
+        raise ValueError(
+            "task configuration has invalid embodiment settings"
+        )
+
+    def embodiment_file(name: str) -> str:
+        configured = embodiment_types[name]["file_path"]
+
+        if configured is None:
+            raise ValueError(
+                f"embodiment has no file path: {name}"
+            )
+
+        return _robot_file(configured)
+
+    if len(embodiment) == 1:
+        task_args["left_robot_file"] = embodiment_file(
+            embodiment[0]
+        )
+
+        task_args["right_robot_file"] = embodiment_file(
+            embodiment[0]
+        )
+
+        task_args["dual_arm_embodied"] = True
+        embodiment_name = str(embodiment[0])
+
+    elif len(embodiment) == 3:
+        task_args["left_robot_file"] = embodiment_file(
+            embodiment[0]
+        )
+
+        task_args["right_robot_file"] = embodiment_file(
+            embodiment[1]
+        )
+
+        task_args["embodiment_dis"] = embodiment[2]
+        task_args["dual_arm_embodied"] = False
+
+        embodiment_name = (
+            f"{embodiment[0]}+{embodiment[1]}"
+        )
+
+    else:
+        raise ValueError(
+            "embodiment configuration must contain one or three items"
+        )
+
+    task_args["left_embodiment_config"] = (
+        _embodiment_config(
+            task_args["left_robot_file"]
+        )
+    )
+
+    task_args["right_embodiment_config"] = (
+        _embodiment_config(
+            task_args["right_robot_file"]
+        )
+    )
+
+    task_args["embodiment_name"] = embodiment_name
+    task_args["task_name"] = task_name
+    task_args["task_config"] = TASK_CONFIG
+
+    # Normal planning and physics are used.
+    # Evaluation does not collect training trajectories or render a viewer.
+    task_args["need_plan"] = True
+    task_args["save_data"] = False
+    task_args["collect_data"] = False
+    task_args["render_freq"] = 0
+    task_args["eval_video_log"] = False
+    task_args["eval_video_save_dir"] = None
+
+    return task_args
+
+
+def _error_name(
+    error: BaseException,
+) -> str:
+    """
+    Return only the exception type.
+
+    Error messages and tracebacks are intentionally excluded because
+    they may reveal task implementation details in the black-box setting.
+    """
+
+    return type(error).__name__
+
+
+def evaluate_seed(
+    task_class: type,
+    task_args: dict[str, Any],
+    policy: Callable[[Any], Any],
+    seed: int,
+) -> dict[str, Any]:
+
+    result: dict[str, Any] = {
+        "seed": seed,
+        "success": False,
+        "plan_success": None,
+        "execution_error": False,
+        "error_stage": None,
+        "error_type": None,
+    }
+
+    close_environment: (
+        Callable[[], Any] | None
+    ) = None
+
+    try:
+        task = task_class()
+
+        close_environment = task.close_env
+
+        task.setup_demo(
+            now_ep_num=seed,
+            seed=seed,
+            **task_args,
+        )
+
+        # Install the generic public policy interface after normal task
+        # initialization and before candidate policy execution.
+        install_public_interface(task)
+
+        # Capture the original success checker before candidate execution.
+        # Candidate code must not replace evaluation behavior.
+        original_check_success = task.check_success
+
+        try:
+            policy(task)
+
+        except (
+            KeyboardInterrupt,
+            GeneratorExit,
+        ):
+            raise
+
+        except BaseException as error:
+            result["execution_error"] = True
+            result["error_stage"] = "policy"
+            result["error_type"] = _error_name(
+                error
+            )
+
+        else:
+            result["plan_success"] = bool(
+                task.plan_success
+            )
+
+            try:
+                result["success"] = bool(
+                    original_check_success()
+                )
+
+            except (
+                KeyboardInterrupt,
+                GeneratorExit,
+            ):
+                raise
+
+            except BaseException as error:
+                result["execution_error"] = True
+                result["error_stage"] = (
+                    "success_check"
+                )
+                result["error_type"] = (
+                    _error_name(error)
+                )
+
+        if result["plan_success"] is None:
+            result["plan_success"] = bool(
+                task.plan_success
+            )
+
+    except (
+        KeyboardInterrupt,
+        GeneratorExit,
+    ):
+        raise
+
+    except BaseException as error:
+        result["execution_error"] = True
+        result["error_stage"] = (
+            "initialization"
+        )
+        result["error_type"] = _error_name(
+            error
+        )
+
+    finally:
+        if close_environment is not None:
+            try:
+                close_environment()
+
+            except (
+                KeyboardInterrupt,
+                GeneratorExit,
+            ):
+                raise
+
+            except BaseException as error:
+                result["success"] = False
+                result["execution_error"] = True
+
+                if result["error_stage"] is None:
+                    result["error_stage"] = (
+                        "cleanup"
+                    )
+                    result["error_type"] = (
+                        _error_name(error)
+                    )
+                else:
+                    result[
+                        "cleanup_error_type"
+                    ] = _error_name(error)
+
+    if result["execution_error"]:
+        result["success"] = False
+
+    return result
+
+
+def write_results(
+    output_path: Path,
+    results: dict[str, Any],
+) -> None:
+
+    output_path = (
+        output_path.expanduser().resolve()
+    )
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    temporary_path = (
+        output_path.parent
+        / f".{output_path.name}.tmp-{os.getpid()}"
+    )
+
+    try:
+        with temporary_path.open(
+            "w",
+            encoding="utf-8",
+        ) as file:
+            json.dump(
+                results,
+                file,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+
+            file.write("\n")
+
+        os.replace(
+            temporary_path,
+            output_path,
+        )
+
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def main() -> int:
+    arguments = parse_args()
+
+    policy, policy_sha256 = load_policy(
+        arguments.policy
+    )
+
+    task_class = load_task_class(
+        arguments.task
+    )
+
+    task_args = load_task_args(
+        arguments.task
+    )
+
+    seeds = SEARCH_SEEDS
+
+    per_seed = []
+
+    for seed in seeds:
+        seed_result = evaluate_seed(
+            task_class,
+            task_args,
+            policy,
+            seed,
+        )
+
+        per_seed.append(seed_result)
+
+        status = (
+            "success"
+            if seed_result["success"]
+            else "failure"
+        )
+
+        print(
+            f"seed={seed} "
+            f"status={status} "
+            f"plan_success="
+            f"{seed_result['plan_success']} "
+            f"execution_error="
+            f"{seed_result['execution_error']}",
+            flush=True,
+        )
+
+    successes = sum(
+        result["success"]
+        for result in per_seed
+    )
+
+    planning_failures = sum(
+        result["plan_success"] is False
+        for result in per_seed
+    )
+
+    execution_errors = sum(
+        result["execution_error"]
+        for result in per_seed
+    )
+
+    summary = {
+        "task": arguments.task,
+        "task_config": TASK_CONFIG,
+        "seed_set": "search",
+        "seeds": seeds,
+        "number_of_episodes": len(seeds),
+        "successes": successes,
+        "success_rate": (
+            successes / len(seeds)
+        ),
+        "planning_failures": (
+            planning_failures
+        ),
+        "execution_errors": (
+            execution_errors
+        ),
+        "policy_sha256": (
+            policy_sha256
+        ),
+        "per_seed": per_seed,
+    }
+
+    write_results(
+        arguments.output,
+        summary,
+    )
+
+    print(
+        f"completed "
+        f"task={arguments.task} "
+        f"seed_set=search "
+        f"successes={successes}/{len(seeds)} "
+        f"output={arguments.output}",
+        flush=True,
+    )
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
